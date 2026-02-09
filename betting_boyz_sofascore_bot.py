@@ -1,4 +1,4 @@
-# Betting Boyz — SofaScore Prediction Bot (NO ODDS)
+# Betting Boyz — SofaScore Prediction Bot (NO ODDS) — PATCHED for 403
 # Pure prediction mode:
 # - Uses SofaScore scheduled events + team recent results to generate confidence-based tips
 # - No bookmaker odds
@@ -45,15 +45,26 @@ CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "21600"))  # 6 hours
 
 # Selection windows (local time on runner)
 MORNING_CUTOFF_HOUR = int(os.getenv("MORNING_CUTOFF_HOUR", "12"))
-LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "36"))  # allow tomorrow morning if today is empty
+LOOKAHEAD_HOURS = int(os.getenv("LOOKAHEAD_HOURS", "36"))  # allow tomorrow if today is empty
 
 # Model config
 LAST_N_MATCHES = int(os.getenv("LAST_N_MATCHES", "8"))
 MIN_CONF_SAFE = float(os.getenv("MIN_CONF_SAFE", "0.62"))
 MIN_CONF_VALUE = float(os.getenv("MIN_CONF_VALUE", "0.55"))
 
-# SofaScore base (unofficial)
-SOFA_BASE = "https://api.sofascore.com/api/v1"
+# ✅ PATCH: Use www.sofascore.com host (often less blocked than api.sofascore.com)
+SOFA_BASE = "https://www.sofascore.com/api/v1"
+
+# ✅ PATCH: Browser-like headers to reduce 403 on GitHub Actions IPs
+SOFA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/121.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.sofascore.com/",
+    "Origin": "https://www.sofascore.com",
+}
 
 
 def _now_local() -> datetime:
@@ -87,21 +98,31 @@ def _cache_path(url: str) -> str:
 def get_json_cached(url: str) -> Dict[str, Any]:
     os.makedirs(CACHE_DIR, exist_ok=True)
     cp = _cache_path(url)
+
+    # Cache hit
     if os.path.exists(cp):
         age = time.time() - os.path.getmtime(cp)
         if age <= CACHE_TTL_SECONDS:
             with open(cp, "r", encoding="utf-8") as f:
                 return json.load(f)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; BettingBoyzBot/1.0; +https://github.com/)",
-        "Accept": "application/json",
-    }
-    r = requests.get(url, headers=headers, timeout=20)
+    # Cache miss
+    r = requests.get(url, headers=SOFA_HEADERS, timeout=25)
+
+    # ✅ Better error message for 403
+    if r.status_code == 403:
+        raise RuntimeError(
+            f"SofaScore returned 403 Forbidden for {url}. "
+            "This usually means the host is blocking GitHub Actions IPs. "
+            "Try re-running once, or run from Android/Termux if it persists."
+        )
+
     r.raise_for_status()
     data = r.json()
+
     with open(cp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+
     return data
 
 
@@ -165,6 +186,7 @@ def fetch_team_last_events(team_id: int, page: int = 0) -> List[Dict[str, Any]]:
 def team_form_from_events(team_id: int, n: int) -> TeamForm:
     events = fetch_team_last_events(team_id, page=0)
     finished: List[Dict[str, Any]] = []
+
     for e in events:
         st = (e.get("status") or {}).get("type")
         if st != "finished":
@@ -178,6 +200,7 @@ def team_form_from_events(team_id: int, n: int) -> TeamForm:
             break
 
     wins = draws = losses = gf = ga = over25 = btts = 0
+
     for e in finished:
         is_home = (e.get("homeTeam") or {}).get("id") == team_id
         hs = int((e.get("homeScore") or {}).get("current") or 0)
@@ -251,7 +274,8 @@ def build_reason_lines(home: TeamForm, away: TeamForm, pick: str) -> List[str]:
         if "Over 2.5" in pick:
             lines.append(f"Over 2.5 hit-rate: Home {home.over25_rate:.0%} | Away {away.over25_rate:.0%}")
         if "BTTS" in pick:
-            lines.append(f"BTTS hit-rate: Home {away.btts_rate:.0%} | Away {away.btts_rate:.0%}")
+            # ✅ bugfix: use correct home/away rates (previously used away twice)
+            lines.append(f"BTTS hit-rate: Home {home.btts_rate:.0%} | Away {away.btts_rate:.0%}")
         return lines
     return ["Not enough recent match data; conservative estimate used."]
 
@@ -273,6 +297,7 @@ class Prediction:
 def candidate_predictions_for_event(event: Dict[str, Any]) -> List[Prediction]:
     home = event.get("homeTeam") or {}
     away = event.get("awayTeam") or {}
+
     tournament = (event.get("tournament") or {}).get("name") or ""
     category = ((event.get("tournament") or {}).get("category") or {}).get("name") or ""
     league = f"{category} - {tournament}".strip(" -")
@@ -292,16 +317,35 @@ def candidate_predictions_for_event(event: Dict[str, Any]) -> List[Prediction]:
     hn = home.get("name") or home.get("shortName") or "Home"
     an = away.get("name") or away.get("shortName") or "Away"
 
-    preds = []
+    preds: List[Prediction] = []
+
     p_hw = prob_home_win(home_form, away_form)
-    preds.append(Prediction(eid, start_dt, kickoff_time, league, hn, an, "Home Win", p_hw, confidence_stars(p_hw),
-                            build_reason_lines(home_form, away_form, "Home Win")))
+    preds.append(
+        Prediction(
+            eid, start_dt, kickoff_time, league, hn, an,
+            "Home Win", p_hw, confidence_stars(p_hw),
+            build_reason_lines(home_form, away_form, "Home Win"),
+        )
+    )
+
     p_o25 = prob_over25(home_form, away_form)
-    preds.append(Prediction(eid, start_dt, kickoff_time, league, hn, an, "Over 2.5 Goals", p_o25, confidence_stars(p_o25),
-                            build_reason_lines(home_form, away_form, "Over 2.5")))
-    p_btts = prob_btts(home_form, away_form)
-    preds.append(Prediction(eid, start_dt, kickoff_time, league, hn, an, "BTTS: Yes", p_btts, confidence_stars(p_btts),
-                            build_reason_lines(home_form, away_form, "BTTS")))
+    preds.append(
+        Prediction(
+            eid, start_dt, kickoff_time, league, hn, an,
+            "Over 2.5 Goals", p_o25, confidence_stars(p_o25),
+            build_reason_lines(home_form, away_form, "Over 2.5"),
+        )
+    )
+
+    p_bt = prob_btts(home_form, away_form)
+    preds.append(
+        Prediction(
+            eid, start_dt, kickoff_time, league, hn, an,
+            "BTTS: Yes", p_bt, confidence_stars(p_bt),
+            build_reason_lines(home_form, away_form, "BTTS"),
+        )
+    )
+
     return preds
 
 
@@ -322,7 +366,8 @@ def distinct_picks(preds: List[Prediction], used: List[str]) -> Tuple[Optional[P
     def match_key(p: Prediction) -> str:
         return f"{p.home_name} vs {p.away_name}"
 
-    safe = value = None
+    safe: Optional[Prediction] = None
+    value: Optional[Prediction] = None
 
     for p in preds:
         if pick_key(p) in used_set:
@@ -403,7 +448,7 @@ def send_whatsapp(message: str) -> None:
 
 def filter_events_by_slot(events: List[Dict[str, Any]], slot: str, target_day: date) -> List[Dict[str, Any]]:
     now = _now_local()
-    out = []
+    out: List[Dict[str, Any]] = []
     for e in events:
         dt = parse_sofa_dt(e.get("startTimestamp"))
         if not dt:
